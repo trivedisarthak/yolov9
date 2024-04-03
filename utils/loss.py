@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
 
+from typing import Union, Tuple
+
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
@@ -361,3 +363,126 @@ class ComputeLoss_NEW:
             # print(f'targets-unique {n1}-{n2} diff={n1-n2}')
 
         return tcls, tbox, indices
+    
+    
+class ChannelWiseDivergence:
+    """PyTorch version of `Channel-wise Distillation for Semantic Segmentation.
+
+    <https://arxiv.org/abs/2011.13256>`_.
+
+    Args:
+        tau (float): Temperature coefficient. Defaults to 1.0.
+        loss_weight (float): Weight of loss. Defaults to 1.0.
+    """
+
+    def __init__(self, tau=1.0, loss_weight=1.0):
+        super(ChannelWiseDivergence, self).__init__()
+        self.tau = tau
+        self.loss_weight = loss_weight
+
+    def __call__(self, preds_S, preds_T):
+        """Forward computation.
+
+        Args:
+            preds_S (torch.Tensor): The student model prediction with
+                shape (N, C, H, W).
+            preds_T (torch.Tensor): The teacher model prediction with
+                shape (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated loss value.
+        """
+        # print(preds_S.shape, preds_T.shape) 
+        loss_total = 0.
+        for sfeat, tfeat in zip(preds_S, preds_T):
+            assert sfeat.shape[-2:] == tfeat.shape[-2:]
+            N, C, H, W = sfeat.shape
+
+            softmax_pred_T = F.softmax(tfeat.view(-1, W * H) / self.tau, dim=1)
+
+            logsoftmax = torch.nn.LogSoftmax(dim=1)
+            loss = torch.sum(softmax_pred_T *
+                            logsoftmax(tfeat.view(-1, W * H) / self.tau) -
+                            softmax_pred_T *
+                            logsoftmax(sfeat.view(-1, W * H) / self.tau)) * (
+                                self.tau**2)
+
+            loss_total+= self.loss_weight * loss / (C * N)
+
+        return loss_total
+
+
+class PKDLoss:
+    """PyTorch version of `PKD: General Distillation Framework for Object
+    Detectors via Pearson Correlation Coefficient.
+
+    <https://arxiv.org/abs/2207.02039>`_.
+
+    Args:
+        loss_weight (float): Weight of loss. Defaults to 1.0.
+        resize_stu (bool): If True, we'll down/up sample the features of the
+            student model to the spatial size of those of the teacher model if
+            their spatial sizes are different. And vice versa. Defaults to
+            True.
+    """
+
+    def __init__(self, loss_weight=1.0, resize_stu=True):
+        super(PKDLoss, self).__init__()
+        self.loss_weight = loss_weight
+        self.resize_stu = resize_stu
+
+    def norm(self, feat: torch.Tensor) -> torch.Tensor:
+        """Normalize the feature maps to have zero mean and unit variances.
+
+        Args:
+            feat (torch.Tensor): The original feature map with shape
+                (N, C, H, W).
+        """
+        assert len(feat.shape) == 4
+        N, C, H, W = feat.shape
+        feat = feat.permute(1, 0, 2, 3).reshape(C, -1)
+        mean = feat.mean(dim=-1, keepdim=True)
+        std = feat.std(dim=-1, keepdim=True)
+        feat = (feat - mean) / (std + 1e-6)
+        return feat.reshape(C, N, H, W).permute(1, 0, 2, 3)
+
+    def __call__(self, preds_S: Union[torch.Tensor, Tuple],
+                preds_T: Union[torch.Tensor, Tuple]) -> torch.Tensor:
+        """Forward computation.
+
+        Args:
+            preds_S (torch.Tensor | Tuple[torch.Tensor]): The student model
+                prediction. If tuple, it should be several tensors with shape
+                (N, C, H, W).
+            preds_T (torch.Tensor | Tuple[torch.Tensor]): The teacher model
+                prediction. If tuple, it should be several tensors with shape
+                (N, C, H, W).
+
+        Return:
+            torch.Tensor: The calculated loss value.
+        """
+        if isinstance(preds_S, torch.Tensor):
+            preds_S, preds_T = (preds_S, ), (preds_T, )
+
+        loss = 0.
+
+        for pred_S, pred_T in zip(preds_S, preds_T):
+            size_S, size_T = pred_S.shape[2:], pred_T.shape[2:]
+            
+            if size_S[0] != size_T[0]:
+                if self.resize_stu:
+                    pred_S = F.interpolate(pred_S, size_T, mode='bilinear')
+                else:
+                    pred_T = F.interpolate(pred_T, size_S, mode='bilinear')
+            print(pred_S.shape, pred_T.shape)
+            assert pred_S.shape == pred_T.shape
+
+            norm_S, norm_T = self.norm(pred_S), self.norm(pred_T)
+
+            # First conduct feature normalization and then calculate the
+            # MSE loss. Methematically, it is equivalent to firstly calculate
+            # the Pearson Correlation Coefficient (r) between two feature
+            # vectors, and then use 1-r as the new feature imitation loss.
+            loss += F.mse_loss(norm_S, norm_T) / 2
+
+        return loss * self.loss_weight

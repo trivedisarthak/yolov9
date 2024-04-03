@@ -38,6 +38,7 @@ from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, ch
 from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
 from utils.loss_tal_dual import ComputeLoss
+from utils.loss import ChannelWiseDivergence
 #from utils.loss_tal_dual import ComputeLossLH as ComputeLoss
 #from utils.loss_tal_dual import ComputeLossLHCF as ComputeLoss
 from utils.metrics import fitness
@@ -118,6 +119,50 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = check_amp(model)  # check AMP
 
+    if opt.teacher_weights:
+        resize_layers = []
+        teacher_weight = opt.teacher_weights
+        with torch_distributed_zero_first(LOCAL_RANK):
+            teacher_weight = attempt_download(teacher_weight)  # download if not found locally
+        teacher_ckpt = torch.load(teacher_weight, map_location=device) 
+        teacher_model = Model(teacher_ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        teacher_model.eval()
+        
+        if opt.feat_teacher is not None:
+            teacher_feat = {}
+            def getActivation(name):
+                # the hook signature
+                def hook(model, input, output):
+                    teacher_feat[name] = output.detach()
+                return hook
+            teacher_hooks = []
+            for m in teacher_model.model:
+                if m.i in opt.feat_teacher:
+                    teacher_hooks.append(m.register_forward_hook(getActivation(m)))
+        if opt.feat_student is not None:
+            student_feat = {}
+            def getActivation(name):
+                # the hook signature
+                def hook(model, input, output):
+                    student_feat[name] = output.detach()
+                return hook
+            student_hooks = []
+            for m in model.model:
+                if m.i in opt.feat_student:
+                    student_hooks.append(m.register_forward_hook(getActivation(m)))
+        
+        # dumy run to get the feature maps
+        dummy_input = torch.randn(1, 3, opt.imgsz, opt.imgsz).to(device)
+        _ = teacher_model(dummy_input)
+        _ = model(dummy_input)
+        for sfeat, tfeat in zip(student_feat.values(), teacher_feat.values()):
+            _, student_channel, student_out_size, _ = sfeat.shape
+            _, teacher_channel, teacher_out_size, _ = tfeat.shape
+        
+            resize_layers.append(nn.Sequential(nn.Conv2d(student_channel, teacher_channel, 3, padding=1, stride=int(student_out_size / teacher_out_size)), nn.ReLU()).to(device))
+
+        LOGGER.info(f'Load teacher model from {teacher_weight}')  # report
+    
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -254,7 +299,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = ComputeLoss(model)  # init loss class#
+    compute_loss_distill = ChannelWiseDivergence(loss_weight=0.01)
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
@@ -311,8 +357,22 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
             # Forward
             with torch.cuda.amp.autocast(amp):
+                if opt.feat_student is not None:
+                    student_hooks = []
+                    for m in model.model:
+                        if m.i in opt.feat_student:
+                            student_hooks.append(m.register_forward_hook(getActivation(m)))
                 pred = model(imgs)  # forward
+                with torch.no_grad():
+                    _ = teacher_model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                for i,sfeat in enumerate(student_feat):
+                    student_feat[sfeat]=resize_layers[i](student_feat[sfeat])
+                loss+= compute_loss_distill(student_feat.values(), teacher_feat.values())
+                for hook in student_hooks:
+                    hook.remove()
+                student_feat.clear()
+                teacher_feat.clear()
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -477,7 +537,9 @@ def parse_opt(known=False):
     parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
     parser.add_argument('--min-items', type=int, default=0, help='Experimental')
     parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
-
+    parser.add_argument('--feat-student',  nargs='+', type=int, default=None, help='Feature map indices to use for student')
+    parser.add_argument('--feat-teacher',  nargs='+', type=int, default=None, help='Feature map indices to use for teacher')
+    parser.add_argument('--teacher-weights', type=str, default='', help='Teacher weights path')
     # Logger arguments
     parser.add_argument('--entity', default=None, help='Entity')
     parser.add_argument('--upload_dataset', nargs='?', const=True, default=False, help='Upload data, "val" option')
