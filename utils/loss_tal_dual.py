@@ -90,7 +90,7 @@ class BboxLoss(nn.Module):
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
         iou_map = torch.zeros_like(fg_mask, dtype=pred_bboxes.dtype)
-        iou_map[fg_mask] = iou.detach()
+        iou_map[fg_mask] = iou.detach().to(iou_map.dtype)
 
         return loss_iou, loss_dfl, iou_map
 
