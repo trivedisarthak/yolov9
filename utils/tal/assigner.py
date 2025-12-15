@@ -59,7 +59,8 @@ class TaskAlignedAssigner(nn.Module):
         self.eps = eps
 
     @torch.no_grad()
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, mask_pos=None,
+                return_pos_mask=False):
         """This code referenced to
            https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py
 
@@ -86,8 +87,12 @@ class TaskAlignedAssigner(nn.Module):
                     torch.zeros_like(pd_scores).to(device),
                     torch.zeros_like(pd_scores[..., 0]).to(device))
 
-        mask_pos, align_metric, overlaps = self.get_pos_mask(pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points,
-                                                             mask_gt)
+        if mask_pos is None:
+            mask_pos, align_metric, overlaps = self.get_pos_mask(pd_scores, pd_bboxes, gt_labels, gt_bboxes,
+                                                                 anc_points, mask_gt)
+        else:
+            align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes)
+            mask_pos = mask_pos.to(align_metric.dtype)
 
         target_gt_idx, fg_mask, mask_pos = select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
 
@@ -100,6 +105,9 @@ class TaskAlignedAssigner(nn.Module):
         pos_overlaps = (overlaps * mask_pos).amax(axis=-1, keepdim=True)  # b, max_num_obj
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
+
+        if return_pos_mask:
+            return target_labels, target_bboxes, target_scores, fg_mask.bool(), mask_pos
 
         return target_labels, target_bboxes, target_scores, fg_mask.bool()
 
