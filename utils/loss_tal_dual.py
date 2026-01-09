@@ -89,7 +89,10 @@ class BboxLoss(nn.Module):
         else:
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
-        return loss_iou, loss_dfl, iou
+        iou_map = torch.zeros_like(fg_mask, dtype=pred_bboxes.dtype)
+        iou_map[fg_mask] = iou.detach().to(iou_map.dtype)
+
+        return loss_iou, loss_dfl, iou_map
 
     def _df_loss(self, pred_dist, target):
         target_left = target.to(torch.long)
@@ -131,18 +134,55 @@ class ComputeLoss:
         self.reg_max = m.reg_max
         self.device = device
 
-        self.assigner = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
-                                            num_classes=self.nc,
-                                            alpha=float(os.getenv('YOLOA', 0.5)),
-                                            beta=float(os.getenv('YOLOB', 6.0)))
-        self.assigner2 = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
-                                            num_classes=self.nc,
-                                            alpha=float(os.getenv('YOLOA', 0.5)),
-                                            beta=float(os.getenv('YOLOB', 6.0)))
+        self.assigner_one2one = TaskAlignedAssigner(topk=1,
+                                                    num_classes=self.nc,
+                                                    alpha=float(os.getenv('YOLOA', 0.5)),
+                                                    beta=float(os.getenv('YOLOB', 6.0)))
+        self.assigner_one2many = TaskAlignedAssigner(topk=int(os.getenv('YOLOM', 10)),
+                                                     num_classes=self.nc,
+                                                     alpha=float(os.getenv('YOLOA', 0.5)),
+                                                     beta=float(os.getenv('YOLOB', 6.0)))
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
         self.bbox_loss2 = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
         self.proj = torch.arange(m.reg_max).float().to(device)  # / 120.0
         self.use_dfl = use_dfl
+
+    def _single_branch_loss(self, pred_scores, pred_distri, pred_bboxes, anchor_points, stride_tensor, gt_labels,
+                             gt_bboxes, mask_gt, assigner, bbox_loss_fn, dtype, mask_pos=None, return_pos_mask=False):
+        out = assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+            mask_pos=mask_pos,
+            return_pos_mask=return_pos_mask)
+
+        target_labels, target_bboxes, target_scores, fg_mask, *extras = out
+        branch_mask_pos = extras[0] if extras else None
+
+        target_bboxes /= stride_tensor
+        target_scores_sum = torch.clamp(target_scores.sum(), min=1.0)
+
+        box_loss = pred_scores.new_tensor(0.0)
+        dfl_loss = pred_scores.new_tensor(0.0)
+        iou_map = torch.zeros_like(pred_scores[..., 0])
+        if fg_mask.sum():
+            box_loss, dfl_loss, iou_map = bbox_loss_fn(pred_distri,
+                                                       pred_bboxes,
+                                                       anchor_points,
+                                                       target_bboxes,
+                                                       target_scores,
+                                                       target_scores_sum,
+                                                       fg_mask)
+
+        cls_targets = target_scores.to(dtype)
+        cls_targets *= iou_map.unsqueeze(-1)
+        target_scores_sum = torch.clamp(cls_targets.sum(), min=1.0)
+        cls_loss = self.BCEcls(pred_scores, cls_targets).sum() / target_scores_sum
+
+        return box_loss, cls_loss, dfl_loss, branch_mask_pos
 
     def preprocess(self, targets, batch_size, scale_tensor):
         if targets.shape[0] == 0:
@@ -185,7 +225,8 @@ class ComputeLoss:
         dtype = pred_scores.dtype
         batch_size, grid_size = pred_scores.shape[:2]
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride[:len(feats)], 0.5)
+        anchor_points2, stride_tensor2 = make_anchors(feats2, self.stride[:len(feats2)], 0.5)
 
         # targets
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
@@ -194,55 +235,61 @@ class ComputeLoss:
 
         # pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        pred_bboxes2 = self.bbox_decode(anchor_points, pred_distri2)  # xyxy, (b, h*w, 4)
+        pred_bboxes2 = self.bbox_decode(anchor_points2, pred_distri2)  # xyxy, (b, h*w, 4)
 
-        target_labels, target_bboxes, target_scores, fg_mask = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt)
-        target_labels2, target_bboxes2, target_scores2, fg_mask2 = self.assigner2(
-            pred_scores2.detach().sigmoid(),
-            (pred_bboxes2.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt)
+        box_loss2, cls_loss2, dfl_loss2, _ = self._single_branch_loss(pred_scores2,
+                                                                      pred_distri2,
+                                                                      pred_bboxes2,
+                                                                      anchor_points2,
+                                                                      stride_tensor2,
+                                                                      gt_labels,
+                                                                      gt_bboxes,
+                                                                      mask_gt,
+                                                                      self.assigner_one2many,
+                                                                      self.bbox_loss2,
+                                                                      dtype,
+                                                                      return_pos_mask=False)
+        box_loss_o2o, cls_loss_o2o, dfl_loss_o2o, _ = self._single_branch_loss(pred_scores,
+                                                                               pred_distri,
+                                                                               pred_bboxes,
+                                                                               anchor_points,
+                                                                               stride_tensor,
+                                                                               gt_labels,
+                                                                               gt_bboxes,
+                                                                               mask_gt,
+                                                                               self.assigner_one2one,
+                                                                               self.bbox_loss,
+                                                                               dtype,
+                                                                               return_pos_mask=False)
 
-        target_bboxes /= stride_tensor
-        target_scores_sum = max(target_scores.sum(), 1)
-        target_bboxes2 /= stride_tensor
-        target_scores_sum2 = max(target_scores2.sum(), 1)
+        box_loss_m1, cls_loss_m1, dfl_loss_m1, _ = self._single_branch_loss(pred_scores,
+                                                                            pred_distri,
+                                                                            pred_bboxes,
+                                                                            anchor_points,
+                                                                            stride_tensor,
+                                                                            gt_labels,
+                                                                            gt_bboxes,
+                                                                            mask_gt,
+                                                                            self.assigner_one2many,
+                                                                            self.bbox_loss,
+                                                                            dtype,
+                                                                            return_pos_mask=False)
+        box_loss_o2o2, cls_loss_o2o2, dfl_loss_o2o2, _ = self._single_branch_loss(pred_scores2,
+                                                                                  pred_distri2,
+                                                                                  pred_bboxes2,
+                                                                                  anchor_points2,
+                                                                                  stride_tensor2,
+                                                                                  gt_labels,
+                                                                                  gt_bboxes,
+                                                                                  mask_gt,
+                                                                                  self.assigner_one2one,
+                                                                                  self.bbox_loss2,
+                                                                                  dtype,
+                                                                                  return_pos_mask=False)
 
-        # cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum # BCE
-        loss[1] *= 0.25
-        loss[1] += self.BCEcls(pred_scores2, target_scores2.to(dtype)).sum() / target_scores_sum2 # BCE
-
-        # bbox loss
-        if fg_mask.sum():
-            loss[0], loss[2], iou = self.bbox_loss(pred_distri,
-                                                   pred_bboxes,
-                                                   anchor_points,
-                                                   target_bboxes,
-                                                   target_scores,
-                                                   target_scores_sum,
-                                                   fg_mask)
-            loss[0] *= 0.25
-            loss[2] *= 0.25
-        if fg_mask2.sum():
-            loss0_, loss2_, iou2 = self.bbox_loss2(pred_distri2,
-                                                   pred_bboxes2,
-                                                   anchor_points,
-                                                   target_bboxes2,
-                                                   target_scores2,
-                                                   target_scores_sum2,
-                                                   fg_mask2)
-            loss[0] += loss0_
-            loss[2] += loss2_
+        loss[0] = (box_loss_o2o * 0.25 + box_loss_m1) + (box_loss_o2o2 * 0.25 + box_loss2)
+        loss[1] = (cls_loss_o2o * 0.25 + cls_loss_m1) + (cls_loss_o2o2 * 0.25 + cls_loss2)
+        loss[2] = (dfl_loss_o2o * 0.25 + dfl_loss_m1) + (dfl_loss_o2o2 * 0.25 + dfl_loss2)
 
         loss[0] *= 7.5  # box gain
         loss[1] *= 0.5  # cls gain
